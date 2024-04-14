@@ -7,26 +7,28 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 
 	"github.com/dustin/go-humanize"
 )
 
 const (
-	rootDirDefault       = "/"
-	sizeThresholdDefault = "100MB"
+	rootDirDefault         = "/"
+	sizeThresholdDefault   = "100MB"
+	ignoreDirRegexpDefault = ""
 )
 
 func main() {
 	rootDir := flag.String("d", rootDirDefault, "directory to search")
 	sizeThreshold := flag.String("s", sizeThresholdDefault, "print directories and files exceeding this threshold (example: 100MB)")
+	ignoreDirRegexp := flag.String("i", ignoreDirRegexpDefault, "regexp of directories to ignore")
 	flag.Parse()
 
-	sizeThresholdParsed, err := humanize.ParseBigBytes(*sizeThreshold)
+	visualiser, err := newVisualiser(*sizeThreshold, *ignoreDirRegexp)
 	if err != nil {
-		log.Fatalf("invalid size threshold '%v': %v", *sizeThreshold, err)
+		log.Fatalf("%v", err)
 	}
 
-	visualiser := newVisualiser(sizeThresholdParsed.Int64())
 	visualiser.visualise(*rootDir)
 
 	return
@@ -34,16 +36,36 @@ func main() {
 
 type visualiser struct {
 	sizeThreshold int64
+	ignoreRegexp  *regexp.Regexp
 }
 
-func newVisualiser(sizeThreshold int64) *visualiser {
-	return &visualiser{
-		sizeThreshold: sizeThreshold,
+func newVisualiser(sizeThreshold string, ignoreRegexp string) (*visualiser, error) {
+	v := &visualiser{}
+
+	sizeThresholdParsed, err := humanize.ParseBigBytes(sizeThreshold)
+	if err != nil {
+		return nil, fmt.Errorf("invalid size threshold '%v': %v", sizeThreshold, err)
 	}
+
+	v.sizeThreshold = sizeThresholdParsed.Int64()
+
+	if ignoreRegexp != "" {
+		ignoreRegexpParsed, err := regexp.Compile(ignoreRegexp)
+		if err != nil {
+			return nil, fmt.Errorf("could not compile regexp '%s': %v", ignoreRegexp, err)
+		}
+		v.ignoreRegexp = ignoreRegexpParsed
+	}
+
+	return v, nil
+}
+
+func (v *visualiser) shouldSkipDir(dir string) bool {
+	return v.ignoreRegexp != nil && v.ignoreRegexp.MatchString(dir)
 }
 
 func (v *visualiser) visualise(dir string) {
-	dirSize, _, err := getDirSize(dir, v.sizeThreshold)
+	dirSize, _, err := v.getDirSize(dir)
 	if err != nil {
 		log.Printf("error: could not visualise directory %v: %v", dir, err)
 		return
@@ -57,7 +79,7 @@ func (v *visualiser) visualise(dir string) {
 
 // getDirSize calculates size for the given directory recursively. It prints size of entries
 // exceeding the sizeThreshold.
-func getDirSize(dir string, sizeThreshold int64) (int64, int, error) {
+func (v *visualiser) getDirSize(dir string) (int64, int, error) {
 	dirEntries, err := os.ReadDir(dir)
 	if err != nil {
 		log.Printf("error: could not read contents of directory %v: %v", dir, err)
@@ -87,9 +109,17 @@ func getDirSize(dir string, sizeThreshold int64) (int64, int, error) {
 			}
 
 		case entry.Type().IsDir():
+			if v.shouldSkipDir(fullPath) {
+				log.Printf(
+					"warning: ignoring directory '%v' due to matched ignore-regexp", fullPath,
+				)
+
+				continue
+			}
+
 			var filesPrintedInThisEntry int
 
-			entrySize, filesPrintedInThisEntry, err = getDirSize(fullPath, sizeThreshold)
+			entrySize, filesPrintedInThisEntry, err = v.getDirSize(fullPath)
 			if err != nil {
 				log.Printf("error: could not read contents of directory %v: %v", dir, err)
 				log.Printf("warning: will skip directory %v in calculations", dir)
@@ -102,7 +132,7 @@ func getDirSize(dir string, sizeThreshold int64) (int64, int, error) {
 			}
 		}
 
-		if entrySize > sizeThreshold {
+		if entrySize > v.sizeThreshold {
 			if entry.Type().IsRegular() && filesPrintedInThisDir == 0 {
 				// create an empty line before a group of files in one directory
 				fmt.Println()
